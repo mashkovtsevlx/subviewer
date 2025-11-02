@@ -34,6 +34,7 @@
         -webkit-backdrop-filter: saturate(140%) blur(8px);
         padding: 12px;
         display: flex;
+        flex-wrap: wrap;
         gap: 10px;
         align-items: center;
         z-index: 10;
@@ -52,6 +53,26 @@
         padding: 8px;
         border-radius: 8px;
         max-width: 50vw;
+      }
+
+      .time-controls {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: 1;
+        min-width: 220px;
+      }
+
+      .time-slider {
+        flex: 1;
+        accent-color: #1f6feb;
+      }
+
+      .time-display {
+        font-size: 13px;
+        color: #bbb;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
       }
 
       .btn {
@@ -114,6 +135,19 @@
         <input id="fileInput" type="file" accept=".srt,text/plain" />
         <button id="startBtn" class="btn" disabled>Start</button>
         <button id="pauseBtn" class="btn" disabled>Pause</button>
+        <div class="time-controls">
+          <input
+            id="timeSlider"
+            class="time-slider"
+            type="range"
+            min="0"
+            max="0"
+            value="0"
+            step="50"
+            disabled
+          />
+          <div id="timeDisplay" class="time-display">00:00:00.000 / 00:00:00.000</div>
+        </div>
         <div id="status" class="status">No file loaded</div>
       </div>
 
@@ -138,6 +172,12 @@
         const subtitleEl = document.getElementById('subtitle');
         /** @type {HTMLDivElement} */
         const statusEl = document.getElementById('status');
+        /** @type {HTMLInputElement} */
+        const timeSlider = document.getElementById('timeSlider');
+        /** @type {HTMLDivElement} */
+        const timeDisplay = document.getElementById('timeDisplay');
+        /** @type {HTMLDivElement} */
+        const stageEl = document.querySelector('.stage');
 
         /** @type {Cue[]} */
         let cues = [];
@@ -146,6 +186,8 @@
         let startEpochMs = 0;
         let pausedElapsedMs = 0; // elapsed time when paused
         let currentIndex = 0;
+        let totalDurationMs = 0;
+        let userAdjustingSlider = false;
 
         function escapeHtml(unsafe) {
           return String(unsafe)
@@ -154,6 +196,24 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#039;');
+        }
+
+        function pad(num, size) {
+          return String(num).padStart(size, '0');
+        }
+
+        function formatTimecode(ms) {
+          const clamped = Math.max(0, Math.floor(ms));
+          const totalSeconds = Math.floor(clamped / 1000);
+          const milliseconds = clamped % 1000;
+          const seconds = totalSeconds % 60;
+          const minutes = Math.floor(totalSeconds / 60) % 60;
+          const hours = Math.floor(totalSeconds / 3600);
+          return `${pad(hours, 2)}:${pad(minutes, 2)}:${pad(seconds, 2)}.${pad(milliseconds, 3)}`;
+        }
+
+        function formatTimecodeShort(ms) {
+          return (ms / 1000).toFixed(1) + 's';
         }
 
         function msFromTimestamp(h, m, s, ms) {
@@ -208,6 +268,67 @@
           statusEl.textContent = msg;
         }
 
+        function updateTimeUI(elapsed, { force = false } = {}) {
+          if (!cues.length) {
+            timeDisplay.textContent = '00:00:00.000 / 00:00:00.000';
+            timeSlider.value = '0';
+            return;
+          }
+          const clamped = Math.max(0, Math.min(elapsed, totalDurationMs));
+          if (!userAdjustingSlider || force) {
+            timeSlider.value = String(clamped);
+          }
+          timeDisplay.textContent = `${formatTimecode(clamped)} / ${formatTimecode(totalDurationMs)}`;
+        }
+
+        function findCueIndexForElapsed(elapsed) {
+          if (!cues.length) return 0;
+          let low = 0;
+          let high = cues.length - 1;
+          let result = cues.length;
+          while (low <= high) {
+            const mid = (low + high) >> 1;
+            const cue = cues[mid];
+            if (cue.end < elapsed) {
+              low = mid + 1;
+            } else {
+              result = mid;
+              high = mid - 1;
+            }
+          }
+          return result;
+        }
+
+        function renderCueForElapsed(elapsed) {
+          if (!cues.length) {
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+            return;
+          }
+
+          if (currentIndex >= cues.length) {
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+            return;
+          }
+
+          const cue = cues[currentIndex];
+          if (elapsed >= cue.start && elapsed <= cue.end) {
+            const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
+            if (subtitleEl.innerHTML !== html) {
+              subtitleEl.innerHTML = html;
+            }
+          } else if (elapsed < cue.start) {
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+          } else if (elapsed > cue.end) {
+            // Elapsed is past this cue; bump index and try again recursively
+            currentIndex = Math.min(currentIndex + 1, cues.length);
+            renderCueForElapsed(elapsed);
+          }
+        }
+
+        function getElapsedMs() {
+          return playing ? Date.now() - startEpochMs : pausedElapsedMs;
+        }
+
         function clearTimer() {
           if (timerId !== null) {
             clearInterval(timerId);
@@ -215,22 +336,24 @@
           }
         }
 
-        function resetPlaybackState() {
+        function resetPlaybackState({ elapsed = 0 } = {}) {
           clearTimer();
           playing = false;
           startEpochMs = 0;
-          pausedElapsedMs = 0;
-          currentIndex = 0;
-          subtitleEl.innerHTML = '';
+          pausedElapsedMs = Math.max(0, Math.min(elapsed, totalDurationMs));
+          currentIndex = findCueIndexForElapsed(pausedElapsedMs);
+          renderCueForElapsed(pausedElapsedMs);
+          updateTimeUI(pausedElapsedMs, { force: true });
           pauseBtn.textContent = 'Pause';
         }
 
         function startPlayback() {
           if (!cues.length) return;
-          resetPlaybackState();
+          const sliderValue = Number(timeSlider.value) || 0;
+          const startAt = Math.max(0, Math.min(sliderValue, totalDurationMs));
+          resetPlaybackState({ elapsed: startAt });
           playing = true;
-          // Start aligned so first subtitle appears immediately
-          startEpochMs = Date.now() - (cues[0]?.start || 0);
+          startEpochMs = Date.now() - pausedElapsedMs;
           pauseBtn.disabled = false;
           setStatus('Playing…');
           timerId = setInterval(tick, 100);
@@ -246,6 +369,7 @@
             clearTimer();
             pauseBtn.textContent = 'Resume';
             setStatus('Paused at ' + (pausedElapsedMs / 1000).toFixed(1) + 's');
+            updateTimeUI(pausedElapsedMs, { force: true });
           } else {
             // Resume
             playing = true;
@@ -259,29 +383,37 @@
         function tick() {
           if (!playing) return;
           const elapsed = Date.now() - startEpochMs;
-          // Advance index for past cues
-          while (currentIndex < cues.length && elapsed > cues[currentIndex].end) {
-            currentIndex++;
-          }
-
+          currentIndex = findCueIndexForElapsed(elapsed);
           if (currentIndex >= cues.length) {
             subtitleEl.innerHTML = '';
+            pausedElapsedMs = totalDurationMs;
+            updateTimeUI(totalDurationMs, { force: true });
             setStatus('Finished');
             clearTimer();
             playing = false;
+            pauseBtn.textContent = 'Pause';
             return;
           }
 
-          const cue = cues[currentIndex];
-          if (elapsed >= cue.start && elapsed <= cue.end) {
-            // Show cue
-            const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
-            if (subtitleEl.innerHTML !== html) {
-              subtitleEl.innerHTML = html;
-            }
-          } else if (elapsed < cue.start) {
-            // Before next cue
-            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+          renderCueForElapsed(elapsed);
+          updateTimeUI(elapsed);
+        }
+
+        function seekTo(elapsed) {
+          if (!cues.length) return;
+          const clamped = Math.max(0, Math.min(elapsed, totalDurationMs));
+          pausedElapsedMs = clamped;
+          currentIndex = findCueIndexForElapsed(clamped);
+          renderCueForElapsed(clamped);
+          updateTimeUI(clamped, { force: true });
+          if (playing) {
+            startEpochMs = Date.now() - clamped;
+          }
+        }
+
+        function handleScrubStatus(elapsed) {
+          if (!playing) {
+            setStatus('Scrubbed to ' + formatTimecodeShort(elapsed));
           }
         }
 
@@ -296,8 +428,14 @@
                 setStatus('Could not parse SRT');
                 startBtn.disabled = true;
                 pauseBtn.disabled = true;
+                timeSlider.disabled = true;
                 return;
               }
+              totalDurationMs = cues[cues.length - 1].end;
+              timeSlider.disabled = false;
+              timeSlider.max = String(totalDurationMs);
+              timeSlider.value = '0';
+              updateTimeUI(0, { force: true });
               resetPlaybackState();
               startBtn.disabled = false;
               pauseBtn.disabled = true;
@@ -307,6 +445,7 @@
               setStatus('Error reading SRT');
               startBtn.disabled = true;
               pauseBtn.disabled = true;
+              timeSlider.disabled = true;
             }
           };
           reader.onerror = () => {
@@ -317,6 +456,38 @@
 
         startBtn.addEventListener('click', startPlayback);
         pauseBtn.addEventListener('click', pauseOrResume);
+
+        timeSlider.addEventListener('pointerdown', () => {
+          userAdjustingSlider = true;
+        });
+        timeSlider.addEventListener('pointerup', () => {
+          userAdjustingSlider = false;
+        });
+        timeSlider.addEventListener('pointercancel', () => {
+          userAdjustingSlider = false;
+        });
+
+        timeSlider.addEventListener('input', () => {
+          if (!cues.length) return;
+          const target = Number(timeSlider.value) || 0;
+          seekTo(target);
+        });
+
+        timeSlider.addEventListener('change', () => {
+          if (!cues.length) return;
+          const target = Number(timeSlider.value) || 0;
+          handleScrubStatus(target);
+        });
+
+        stageEl.addEventListener('wheel', (event) => {
+          if (!cues.length) return;
+          event.preventDefault();
+          const modifier = event.ctrlKey || event.metaKey ? 50 : event.shiftKey ? 150 : 400;
+          const delta = event.deltaY * modifier;
+          const newElapsed = getElapsedMs() + delta;
+          seekTo(newElapsed);
+          handleScrubStatus(pausedElapsedMs);
+        }, { passive: false });
 
         // Prevent screen dimming as much as possible by keeping interactions simple
         // and minimizing unnecessary reflows. For iOS, consider turning off Auto-Lock in Settings for long sessions.
