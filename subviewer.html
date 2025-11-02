@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Subtitle Viewer (SRT)</title>
+    <style>
+      html, body {
+        height: 100%;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: #000;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        touch-action: manipulation;
+      }
+
+      .viewport {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .controls {
+        position: sticky;
+        top: 0;
+        width: 100%;
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: saturate(140%) blur(8px);
+        -webkit-backdrop-filter: saturate(140%) blur(8px);
+        padding: 12px;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        z-index: 10;
+      }
+
+      .controls label {
+        font-size: 14px;
+        opacity: 0.9;
+        white-space: nowrap;
+      }
+
+      .controls input[type="file"] {
+        color: #fff;
+        border: 1px solid #333;
+        background: #111;
+        padding: 8px;
+        border-radius: 8px;
+        max-width: 50vw;
+      }
+
+      .btn {
+        appearance: none;
+        -webkit-appearance: none;
+        background: #1f6feb;
+        color: #fff;
+        border: none;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-weight: 600;
+        font-size: 15px;
+      }
+      .btn:disabled {
+        background: #2a2a2a;
+        color: #888;
+      }
+
+      .status {
+        margin-left: auto;
+        font-size: 13px;
+        color: #bbb;
+        white-space: nowrap;
+      }
+
+      .stage {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+
+      .subtitle {
+        width: 100%;
+        max-width: 1200px;
+        text-align: center;
+        font-size: clamp(22px, 6vw, 42px);
+        line-height: 1.35;
+        color: #fff;
+        text-shadow:
+          0 2px 2px rgba(0,0,0,0.9),
+          0 0 1px rgba(0,0,0,0.9),
+          0 0 12px rgba(0,0,0,0.7);
+        padding: 10px 16px;
+      }
+
+      .footer-note {
+        text-align: center;
+        font-size: 12px;
+        color: #888;
+        padding: 8px 0 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="viewport">
+      <div class="controls">
+        <label for="fileInput">Choose SRT:</label>
+        <input id="fileInput" type="file" accept=".srt,text/plain" />
+        <button id="startBtn" class="btn" disabled>Start</button>
+        <button id="pauseBtn" class="btn" disabled>Pause</button>
+        <div id="status" class="status">No file loaded</div>
+      </div>
+
+      <div class="stage">
+        <div id="subtitle" class="subtitle"></div>
+      </div>
+
+      <div class="footer-note">This page only displays subtitles; it does not play video.</div>
+    </div>
+
+    <script>
+      (function() {
+        /** @typedef {{ start: number, end: number, text: string }} Cue */
+
+        /** @type {HTMLInputElement} */
+        const fileInput = document.getElementById('fileInput');
+        /** @type {HTMLButtonElement} */
+        const startBtn = document.getElementById('startBtn');
+        /** @type {HTMLButtonElement} */
+        const pauseBtn = document.getElementById('pauseBtn');
+        /** @type {HTMLDivElement} */
+        const subtitleEl = document.getElementById('subtitle');
+        /** @type {HTMLDivElement} */
+        const statusEl = document.getElementById('status');
+
+        /** @type {Cue[]} */
+        let cues = [];
+        let timerId = null;
+        let playing = false;
+        let startEpochMs = 0;
+        let pausedElapsedMs = 0; // elapsed time when paused
+        let currentIndex = 0;
+
+        function escapeHtml(unsafe) {
+          return String(unsafe)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+        }
+
+        function msFromTimestamp(h, m, s, ms) {
+          return ((h * 60 + m) * 60 + s) * 1000 + ms;
+        }
+
+        function parseTimeToMs(timeStr) {
+          // 00:01:23,456
+          const m = timeStr.match(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/);
+          if (!m) return 0;
+          const h = Number(m[1]);
+          const min = Number(m[2]);
+          const s = Number(m[3]);
+          const ms = Number(m[4]);
+          return msFromTimestamp(h, min, s, ms);
+        }
+
+        function parseSrt(text) {
+          const normalized = String(text).replace(/\r/g, '');
+          const blocks = normalized.split(/\n\s*\n/);
+          /** @type {Cue[]} */
+          const parsed = [];
+          for (const block of blocks) {
+            const lines = block.split('\n').filter(Boolean);
+            if (lines.length < 2) continue;
+
+            // Some SRTs start with a numeric index on the first line.
+            // Find the timing line: it should contain -->
+            let timeLineIdx = 0;
+            if (lines[0].includes('-->')) {
+              timeLineIdx = 0;
+            } else if (lines[1] && lines[1].includes('-->')) {
+              timeLineIdx = 1;
+            } else {
+              continue;
+            }
+
+            const timeLine = lines[timeLineIdx];
+            const match = timeLine.match(/(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})/);
+            if (!match) continue;
+            const start = parseTimeToMs(match[1]);
+            const end = parseTimeToMs(match[2]);
+            const textLines = lines.slice(timeLineIdx + 1);
+            const textContent = textLines.join('\n');
+            parsed.push({ start, end, text: textContent });
+          }
+          parsed.sort((a, b) => a.start - b.start);
+          return parsed;
+        }
+
+        function setStatus(msg) {
+          statusEl.textContent = msg;
+        }
+
+        function clearTimer() {
+          if (timerId !== null) {
+            clearInterval(timerId);
+            timerId = null;
+          }
+        }
+
+        function resetPlaybackState() {
+          clearTimer();
+          playing = false;
+          startEpochMs = 0;
+          pausedElapsedMs = 0;
+          currentIndex = 0;
+          subtitleEl.innerHTML = '';
+          pauseBtn.textContent = 'Pause';
+        }
+
+        function startPlayback() {
+          if (!cues.length) return;
+          resetPlaybackState();
+          playing = true;
+          // Start aligned so first subtitle appears immediately
+          startEpochMs = Date.now() - (cues[0]?.start || 0);
+          pauseBtn.disabled = false;
+          setStatus('Playing…');
+          timerId = setInterval(tick, 100);
+        }
+
+        function pauseOrResume() {
+          if (!cues.length) return;
+          if (playing) {
+            // Pause
+            const now = Date.now();
+            pausedElapsedMs = now - startEpochMs;
+            playing = false;
+            clearTimer();
+            pauseBtn.textContent = 'Resume';
+            setStatus('Paused at ' + (pausedElapsedMs / 1000).toFixed(1) + 's');
+          } else {
+            // Resume
+            playing = true;
+            startEpochMs = Date.now() - pausedElapsedMs;
+            pauseBtn.textContent = 'Pause';
+            setStatus('Playing…');
+            timerId = setInterval(tick, 100);
+          }
+        }
+
+        function tick() {
+          if (!playing) return;
+          const elapsed = Date.now() - startEpochMs;
+          // Advance index for past cues
+          while (currentIndex < cues.length && elapsed > cues[currentIndex].end) {
+            currentIndex++;
+          }
+
+          if (currentIndex >= cues.length) {
+            subtitleEl.innerHTML = '';
+            setStatus('Finished');
+            clearTimer();
+            playing = false;
+            return;
+          }
+
+          const cue = cues[currentIndex];
+          if (elapsed >= cue.start && elapsed <= cue.end) {
+            // Show cue
+            const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
+            if (subtitleEl.innerHTML !== html) {
+              subtitleEl.innerHTML = html;
+            }
+          } else if (elapsed < cue.start) {
+            // Before next cue
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+          }
+        }
+
+        fileInput.addEventListener('change', (e) => {
+          const file = fileInput.files && fileInput.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            try {
+              cues = parseSrt(String(reader.result || ''));
+              if (cues.length === 0) {
+                setStatus('Could not parse SRT');
+                startBtn.disabled = true;
+                pauseBtn.disabled = true;
+                return;
+              }
+              resetPlaybackState();
+              startBtn.disabled = false;
+              pauseBtn.disabled = true;
+              setStatus('Loaded ' + cues.length + ' cues');
+            } catch (err) {
+              console.error(err);
+              setStatus('Error reading SRT');
+              startBtn.disabled = true;
+              pauseBtn.disabled = true;
+            }
+          };
+          reader.onerror = () => {
+            setStatus('Failed to read file');
+          };
+          reader.readAsText(file);
+        });
+
+        startBtn.addEventListener('click', startPlayback);
+        pauseBtn.addEventListener('click', pauseOrResume);
+
+        // Prevent screen dimming as much as possible by keeping interactions simple
+        // and minimizing unnecessary reflows. For iOS, consider turning off Auto-Lock in Settings for long sessions.
+      })();
+    </script>
+  </body>
+  </html>
+
+
