@@ -105,6 +105,94 @@
         color: #888;
         padding: 8px 0 12px;
       }
+
+      .timeline-container {
+        position: sticky;
+        bottom: 0;
+        width: 100%;
+        background: rgba(0, 0, 0, 0.7);
+        backdrop-filter: saturate(140%) blur(8px);
+        -webkit-backdrop-filter: saturate(140%) blur(8px);
+        padding: 16px 20px;
+        z-index: 10;
+      }
+
+      .timeline-wrapper {
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+
+      .time-display {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        font-size: 13px;
+        color: #bbb;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .timeline {
+        position: relative;
+        width: 100%;
+        height: 6px;
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 3px;
+        cursor: pointer;
+        margin-bottom: 12px;
+      }
+
+      .timeline-progress {
+        position: absolute;
+        height: 100%;
+        background: #1f6feb;
+        border-radius: 3px;
+        pointer-events: none;
+        transition: width 0.1s linear;
+      }
+
+      .timeline-handle {
+        position: absolute;
+        top: 50%;
+        width: 16px;
+        height: 16px;
+        background: #fff;
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+        cursor: grab;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+        transition: transform 0.1s ease;
+      }
+
+      .timeline-handle:hover,
+      .timeline-handle:active {
+        transform: translate(-50%, -50%) scale(1.2);
+      }
+
+      .timeline-handle:active {
+        cursor: grabbing;
+      }
+
+      .timeline-cues {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+
+      .timeline-cue-marker {
+        position: absolute;
+        width: 2px;
+        height: 100%;
+        background: rgba(255, 255, 255, 0.4);
+        top: 0;
+      }
+
+      .keyboard-hints {
+        text-align: center;
+        font-size: 11px;
+        color: #777;
+        margin-top: 4px;
+      }
     </style>
   </head>
   <body>
@@ -119,6 +207,23 @@
 
       <div class="stage">
         <div id="subtitle" class="subtitle"></div>
+      </div>
+
+      <div class="timeline-container">
+        <div class="timeline-wrapper">
+          <div class="time-display">
+            <span id="currentTime">00:00:00</span>
+            <span id="duration">00:00:00</span>
+          </div>
+          <div id="timeline" class="timeline">
+            <div id="timelineCues" class="timeline-cues"></div>
+            <div id="timelineProgress" class="timeline-progress"></div>
+            <div id="timelineHandle" class="timeline-handle"></div>
+          </div>
+          <div class="keyboard-hints">
+            ← → to skip 5s | ↑ ↓ to skip 30s | Space to pause/play
+          </div>
+        </div>
       </div>
 
       <div class="footer-note">This page only displays subtitles; it does not play video.</div>
@@ -138,6 +243,18 @@
         const subtitleEl = document.getElementById('subtitle');
         /** @type {HTMLDivElement} */
         const statusEl = document.getElementById('status');
+        /** @type {HTMLDivElement} */
+        const timeline = document.getElementById('timeline');
+        /** @type {HTMLDivElement} */
+        const timelineProgress = document.getElementById('timelineProgress');
+        /** @type {HTMLDivElement} */
+        const timelineHandle = document.getElementById('timelineHandle');
+        /** @type {HTMLDivElement} */
+        const timelineCues = document.getElementById('timelineCues');
+        /** @type {HTMLSpanElement} */
+        const currentTimeEl = document.getElementById('currentTime');
+        /** @type {HTMLSpanElement} */
+        const durationEl = document.getElementById('duration');
 
         /** @type {Cue[]} */
         let cues = [];
@@ -146,6 +263,8 @@
         let startEpochMs = 0;
         let pausedElapsedMs = 0; // elapsed time when paused
         let currentIndex = 0;
+        let totalDurationMs = 0;
+        let isDraggingTimeline = false;
 
         function escapeHtml(unsafe) {
           return String(unsafe)
@@ -208,6 +327,73 @@
           statusEl.textContent = msg;
         }
 
+        function formatTime(ms) {
+          const totalSeconds = Math.floor(ms / 1000);
+          const hours = Math.floor(totalSeconds / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const seconds = totalSeconds % 60;
+          return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        }
+
+        function updateTimelineDisplay(elapsedMs) {
+          currentTimeEl.textContent = formatTime(elapsedMs);
+          if (totalDurationMs > 0) {
+            const progress = (elapsedMs / totalDurationMs) * 100;
+            timelineProgress.style.width = Math.min(100, Math.max(0, progress)) + '%';
+            timelineHandle.style.left = Math.min(100, Math.max(0, progress)) + '%';
+          }
+        }
+
+        function renderTimelineCues() {
+          timelineCues.innerHTML = '';
+          if (totalDurationMs === 0 || cues.length === 0) return;
+          
+          cues.forEach(cue => {
+            const marker = document.createElement('div');
+            marker.className = 'timeline-cue-marker';
+            marker.style.left = ((cue.start / totalDurationMs) * 100) + '%';
+            timelineCues.appendChild(marker);
+          });
+        }
+
+        function seekToTime(targetMs) {
+          if (!cues.length) return;
+          
+          // Clamp to valid range
+          targetMs = Math.max(0, Math.min(totalDurationMs, targetMs));
+          
+          // Update playback state
+          if (playing) {
+            startEpochMs = Date.now() - targetMs;
+          } else {
+            pausedElapsedMs = targetMs;
+          }
+          
+          // Find the appropriate cue index
+          currentIndex = 0;
+          while (currentIndex < cues.length && targetMs > cues[currentIndex].end) {
+            currentIndex++;
+          }
+          
+          // Update display
+          updateTimelineDisplay(targetMs);
+          
+          // Show current subtitle if within range
+          if (currentIndex < cues.length) {
+            const cue = cues[currentIndex];
+            if (targetMs >= cue.start && targetMs <= cue.end) {
+              const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
+              subtitleEl.innerHTML = html;
+            } else {
+              subtitleEl.innerHTML = '';
+            }
+          } else {
+            subtitleEl.innerHTML = '';
+          }
+          
+          setStatus(playing ? 'Playing…' : `Paused at ${formatTime(targetMs)}`);
+        }
+
         function clearTimer() {
           if (timerId !== null) {
             clearInterval(timerId);
@@ -223,6 +409,7 @@
           currentIndex = 0;
           subtitleEl.innerHTML = '';
           pauseBtn.textContent = 'Pause';
+          updateTimelineDisplay(0);
         }
 
         function startPlayback() {
@@ -259,6 +446,10 @@
         function tick() {
           if (!playing) return;
           const elapsed = Date.now() - startEpochMs;
+          
+          // Update timeline display
+          updateTimelineDisplay(elapsed);
+          
           // Advance index for past cues
           while (currentIndex < cues.length && elapsed > cues[currentIndex].end) {
             currentIndex++;
@@ -296,9 +487,16 @@
                 setStatus('Could not parse SRT');
                 startBtn.disabled = true;
                 pauseBtn.disabled = true;
+                totalDurationMs = 0;
+                durationEl.textContent = '00:00:00';
                 return;
               }
+              // Calculate total duration from last cue
+              totalDurationMs = cues[cues.length - 1].end;
+              durationEl.textContent = formatTime(totalDurationMs);
+              
               resetPlaybackState();
+              renderTimelineCues();
               startBtn.disabled = false;
               pauseBtn.disabled = true;
               setStatus('Loaded ' + cues.length + ' cues');
@@ -317,6 +515,102 @@
 
         startBtn.addEventListener('click', startPlayback);
         pauseBtn.addEventListener('click', pauseOrResume);
+
+        // Timeline interaction handlers
+        function handleTimelineClick(e) {
+          if (!cues.length || totalDurationMs === 0) return;
+          const rect = timeline.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const percent = x / rect.width;
+          const targetMs = percent * totalDurationMs;
+          seekToTime(targetMs);
+        }
+
+        function handleTimelineDragStart(e) {
+          if (!cues.length || totalDurationMs === 0) return;
+          isDraggingTimeline = true;
+          e.preventDefault();
+        }
+
+        function handleTimelineDrag(e) {
+          if (!isDraggingTimeline) return;
+          const rect = timeline.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const percent = Math.max(0, Math.min(1, x / rect.width));
+          const targetMs = percent * totalDurationMs;
+          seekToTime(targetMs);
+        }
+
+        function handleTimelineDragEnd() {
+          isDraggingTimeline = false;
+        }
+
+        timeline.addEventListener('click', handleTimelineClick);
+        timelineHandle.addEventListener('mousedown', handleTimelineDragStart);
+        document.addEventListener('mousemove', handleTimelineDrag);
+        document.addEventListener('mouseup', handleTimelineDragEnd);
+
+        // Touch support for mobile
+        timelineHandle.addEventListener('touchstart', (e) => {
+          if (!cues.length || totalDurationMs === 0) return;
+          isDraggingTimeline = true;
+          e.preventDefault();
+        });
+
+        document.addEventListener('touchmove', (e) => {
+          if (!isDraggingTimeline) return;
+          const touch = e.touches[0];
+          if (!touch) return;
+          const rect = timeline.getBoundingClientRect();
+          const x = touch.clientX - rect.left;
+          const percent = Math.max(0, Math.min(1, x / rect.width));
+          const targetMs = percent * totalDurationMs;
+          seekToTime(targetMs);
+        });
+
+        document.addEventListener('touchend', handleTimelineDragEnd);
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+          if (!cues.length) return;
+          
+          // Ignore if user is typing in input fields
+          if (e.target.tagName === 'INPUT') return;
+          
+          const currentElapsed = playing ? (Date.now() - startEpochMs) : pausedElapsedMs;
+          
+          switch(e.key) {
+            case ' ':
+            case 'Spacebar':
+              e.preventDefault();
+              pauseOrResume();
+              break;
+            case 'ArrowLeft':
+              e.preventDefault();
+              seekToTime(currentElapsed - 5000); // Skip back 5 seconds
+              break;
+            case 'ArrowRight':
+              e.preventDefault();
+              seekToTime(currentElapsed + 5000); // Skip forward 5 seconds
+              break;
+            case 'ArrowUp':
+              e.preventDefault();
+              seekToTime(currentElapsed - 30000); // Skip back 30 seconds
+              break;
+            case 'ArrowDown':
+              e.preventDefault();
+              seekToTime(currentElapsed + 30000); // Skip forward 30 seconds
+              break;
+            case 'Home':
+              e.preventDefault();
+              seekToTime(0); // Jump to start
+              break;
+            case 'End':
+              e.preventDefault();
+              seekToTime(totalDurationMs); // Jump to end
+              break;
+          }
+        });
 
         // Prevent screen dimming as much as possible by keeping interactions simple
         // and minimizing unnecessary reflows. For iOS, consider turning off Auto-Lock in Settings for long sessions.
