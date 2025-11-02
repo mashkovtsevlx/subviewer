@@ -34,6 +34,7 @@
         -webkit-backdrop-filter: saturate(140%) blur(8px);
         padding: 12px;
         display: flex;
+        flex-wrap: wrap;
         gap: 10px;
         align-items: center;
         z-index: 10;
@@ -68,6 +69,69 @@
       .btn:disabled {
         background: #2a2a2a;
         color: #888;
+      }
+
+      .btn + .timeline {
+        margin-left: 6px;
+      }
+
+      .timeline {
+        appearance: none;
+        -webkit-appearance: none;
+        flex: 1 1 220px;
+        min-width: 160px;
+        height: 6px;
+        border-radius: 999px;
+        background: #1a1a1a;
+        outline: none;
+        margin: 0;
+        transition: background 0.15s ease;
+      }
+
+      .timeline:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+
+      .timeline::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #1f6feb;
+        border: none;
+        box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+        cursor: pointer;
+      }
+
+      .timeline::-moz-range-thumb {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #1f6feb;
+        border: none;
+        box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+        cursor: pointer;
+      }
+
+      .timeline::-webkit-slider-runnable-track {
+        height: 6px;
+        border-radius: 999px;
+        background: #1a1a1a;
+      }
+
+      .timeline::-moz-range-track {
+        height: 6px;
+        border-radius: 999px;
+        background: #1a1a1a;
+      }
+
+      .timecode {
+        font-size: 13px;
+        color: #bbb;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
       }
 
       .status {
@@ -114,6 +178,18 @@
         <input id="fileInput" type="file" accept=".srt,text/plain" />
         <button id="startBtn" class="btn" disabled>Start</button>
         <button id="pauseBtn" class="btn" disabled>Pause</button>
+        <input
+          id="timeline"
+          class="timeline"
+          type="range"
+          min="0"
+          max="0"
+          value="0"
+          step="10"
+          disabled
+          aria-label="Scrub timeline"
+        />
+        <div id="timecode" class="timecode">00:00.0</div>
         <div id="status" class="status">No file loaded</div>
       </div>
 
@@ -134,10 +210,16 @@
         const startBtn = document.getElementById('startBtn');
         /** @type {HTMLButtonElement} */
         const pauseBtn = document.getElementById('pauseBtn');
+        /** @type {HTMLInputElement} */
+        const timelineEl = document.getElementById('timeline');
+        /** @type {HTMLDivElement} */
+        const timecodeEl = document.getElementById('timecode');
         /** @type {HTMLDivElement} */
         const subtitleEl = document.getElementById('subtitle');
         /** @type {HTMLDivElement} */
         const statusEl = document.getElementById('status');
+        /** @type {HTMLDivElement | null} */
+        const stageEl = document.querySelector('.stage');
 
         /** @type {Cue[]} */
         let cues = [];
@@ -146,6 +228,11 @@
         let startEpochMs = 0;
         let pausedElapsedMs = 0; // elapsed time when paused
         let currentIndex = 0;
+        let currentTimeMs = 0;
+        let durationMs = 0;
+        let scrubbing = false;
+        let resumeAfterScrub = false;
+        let lastStatusUpdateMs = 0;
 
         function escapeHtml(unsafe) {
           return String(unsafe)
@@ -215,73 +302,191 @@
           }
         }
 
+        function clamp(value, min, max) {
+          return Math.min(Math.max(value, min), max);
+        }
+
+        function formatTime(ms) {
+          if (!Number.isFinite(ms) || ms < 0) ms = 0;
+          const totalSeconds = Math.floor(ms / 1000);
+          const remainderMs = Math.floor(ms % 1000);
+          const hours = Math.floor(totalSeconds / 3600);
+          const minutes = Math.floor((totalSeconds % 3600) / 60);
+          const seconds = totalSeconds % 60;
+          const tenths = Math.floor(remainderMs / 100);
+          if (hours > 0) {
+            return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${tenths}`;
+          }
+          return `${minutes}:${String(seconds).padStart(2, '0')}.${tenths}`;
+        }
+
+        function findCueIndexFor(timeMs) {
+          if (!cues.length) return -1;
+          let low = 0;
+          let high = cues.length - 1;
+          while (low <= high) {
+            const mid = (low + high) >> 1;
+            const cue = cues[mid];
+            if (timeMs < cue.start) {
+              high = mid - 1;
+            } else if (timeMs > cue.end) {
+              low = mid + 1;
+            } else {
+              return mid;
+            }
+          }
+          return -1;
+        }
+
+        function renderSubtitleAt(timeMs) {
+          if (!cues.length) {
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+            currentIndex = 0;
+            return;
+          }
+          const activeIndex = findCueIndexFor(timeMs);
+          if (activeIndex === -1) {
+            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+            const nextIndex = cues.findIndex((cue) => cue.start > timeMs);
+            currentIndex = nextIndex === -1 ? cues.length : nextIndex;
+            return;
+          }
+          currentIndex = activeIndex;
+          const cue = cues[activeIndex];
+          const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
+          if (subtitleEl.innerHTML !== html) {
+            subtitleEl.innerHTML = html;
+          }
+        }
+
+        function updateTimelineUI(options = {}) {
+          if (!timelineEl) return;
+          const skipSlider = options.skipSlider === true;
+          if (!cues.length) {
+            if (!skipSlider) timelineEl.value = '0';
+            timelineEl.disabled = true;
+            timelineEl.style.background = '#1a1a1a';
+            if (timecodeEl) timecodeEl.textContent = '00:00.0';
+            return;
+          }
+          timelineEl.disabled = false;
+          const sliderValue = String(Math.max(0, Math.round(currentTimeMs)));
+          if (!skipSlider && !scrubbing) {
+            timelineEl.value = sliderValue;
+          }
+          if (durationMs > 0) {
+            const progress = clamp(currentTimeMs / durationMs, 0, 1);
+            const percent = (progress * 100).toFixed(2) + '%';
+            timelineEl.style.background = `linear-gradient(90deg, #1f6feb ${percent}, #1a1a1a ${percent})`;
+          } else {
+            timelineEl.style.background = '#1a1a1a';
+          }
+          if (timecodeEl) {
+            const totalText = durationMs > 0 ? formatTime(durationMs) : '0:00.0';
+            timecodeEl.textContent = `${formatTime(currentTimeMs)} / ${totalText}`;
+          }
+        }
+
+        function updateStatus() {
+          if (!cues.length) {
+            setStatus('No file loaded');
+            return;
+          }
+          if (playing) {
+            setStatus('Playing? ' + formatTime(currentTimeMs));
+          } else if (durationMs > 0 && currentTimeMs >= durationMs) {
+            setStatus('Finished');
+          } else {
+            setStatus('Paused at ' + formatTime(currentTimeMs));
+          }
+          lastStatusUpdateMs = Date.now();
+        }
+
+        function setCurrentTime(timeMs, options = {}) {
+          if (!cues.length) {
+            currentTimeMs = 0;
+            updateTimelineUI(options);
+            return;
+          }
+          const clamped = durationMs > 0 ? clamp(timeMs, 0, durationMs) : Math.max(0, timeMs);
+          currentTimeMs = clamped;
+          if (!playing) {
+            pausedElapsedMs = currentTimeMs;
+          }
+          renderSubtitleAt(currentTimeMs);
+          updateTimelineUI(options);
+          if (!options.skipStatus) {
+            updateStatus();
+          }
+        }
+
         function resetPlaybackState() {
           clearTimer();
           playing = false;
           startEpochMs = 0;
           pausedElapsedMs = 0;
           currentIndex = 0;
+          currentTimeMs = 0;
+          scrubbing = false;
+          resumeAfterScrub = false;
           subtitleEl.innerHTML = '';
           pauseBtn.textContent = 'Pause';
+          pauseBtn.disabled = true;
+          updateTimelineUI({ skipSlider: true });
         }
 
         function startPlayback() {
           if (!cues.length) return;
-          resetPlaybackState();
+          clearTimer();
           playing = true;
-          // Start aligned so first subtitle appears immediately
-          startEpochMs = Date.now() - (cues[0]?.start || 0);
           pauseBtn.disabled = false;
-          setStatus('Playing…');
+          pauseBtn.textContent = 'Pause';
+          startEpochMs = Date.now() - currentTimeMs;
           timerId = setInterval(tick, 100);
+          updateStatus();
         }
 
         function pauseOrResume() {
           if (!cues.length) return;
           if (playing) {
-            // Pause
             const now = Date.now();
             pausedElapsedMs = now - startEpochMs;
+            currentTimeMs = Math.max(0, pausedElapsedMs);
             playing = false;
             clearTimer();
             pauseBtn.textContent = 'Resume';
-            setStatus('Paused at ' + (pausedElapsedMs / 1000).toFixed(1) + 's');
+            renderSubtitleAt(currentTimeMs);
+            updateTimelineUI();
+            updateStatus();
           } else {
-            // Resume
             playing = true;
-            startEpochMs = Date.now() - pausedElapsedMs;
+            startEpochMs = Date.now() - currentTimeMs;
             pauseBtn.textContent = 'Pause';
-            setStatus('Playing…');
             timerId = setInterval(tick, 100);
+            updateStatus();
           }
         }
 
         function tick() {
           if (!playing) return;
           const elapsed = Date.now() - startEpochMs;
-          // Advance index for past cues
-          while (currentIndex < cues.length && elapsed > cues[currentIndex].end) {
-            currentIndex++;
+          currentTimeMs = Math.max(0, elapsed);
+          if (durationMs > 0 && currentTimeMs >= durationMs) {
+            currentTimeMs = durationMs;
           }
+          renderSubtitleAt(currentTimeMs);
+          updateTimelineUI();
 
-          if (currentIndex >= cues.length) {
-            subtitleEl.innerHTML = '';
-            setStatus('Finished');
-            clearTimer();
+          if (durationMs > 0 && currentTimeMs >= durationMs) {
             playing = false;
+            clearTimer();
+            pauseBtn.textContent = 'Resume';
+            updateStatus();
             return;
           }
 
-          const cue = cues[currentIndex];
-          if (elapsed >= cue.start && elapsed <= cue.end) {
-            // Show cue
-            const html = escapeHtml(cue.text).replace(/\n/g, '<br>');
-            if (subtitleEl.innerHTML !== html) {
-              subtitleEl.innerHTML = html;
-            }
-          } else if (elapsed < cue.start) {
-            // Before next cue
-            if (subtitleEl.innerHTML !== '') subtitleEl.innerHTML = '';
+          if (Date.now() - lastStatusUpdateMs > 250) {
+            updateStatus();
           }
         }
 
@@ -292,31 +497,118 @@
           reader.onload = () => {
             try {
               cues = parseSrt(String(reader.result || ''));
+              durationMs = cues.length ? cues[cues.length - 1].end : 0;
+              if (timelineEl) {
+                const sliderMax = durationMs > 0 ? durationMs : 1;
+                timelineEl.max = String(sliderMax);
+                timelineEl.step = '10';
+                timelineEl.value = '0';
+              }
               if (cues.length === 0) {
                 setStatus('Could not parse SRT');
                 startBtn.disabled = true;
                 pauseBtn.disabled = true;
+                updateTimelineUI({ skipSlider: true });
                 return;
               }
               resetPlaybackState();
               startBtn.disabled = false;
               pauseBtn.disabled = true;
+              updateTimelineUI();
               setStatus('Loaded ' + cues.length + ' cues');
             } catch (err) {
               console.error(err);
               setStatus('Error reading SRT');
               startBtn.disabled = true;
               pauseBtn.disabled = true;
+              durationMs = 0;
+              resetPlaybackState();
             }
           };
           reader.onerror = () => {
             setStatus('Failed to read file');
+            durationMs = 0;
+            resetPlaybackState();
           };
           reader.readAsText(file);
         });
 
-        startBtn.addEventListener('click', startPlayback);
+        startBtn.addEventListener('click', () => {
+          if (!cues.length) return;
+          setCurrentTime(0, { skipStatus: true });
+          pausedElapsedMs = 0;
+          startPlayback();
+        });
         pauseBtn.addEventListener('click', pauseOrResume);
+
+        if (timelineEl) {
+          const beginScrub = () => {
+            if (scrubbing || !cues.length) return;
+            scrubbing = true;
+            resumeAfterScrub = false;
+            if (playing) {
+              resumeAfterScrub = true;
+              pauseOrResume();
+            }
+            setStatus('Scrubbing at ' + formatTime(currentTimeMs));
+            lastStatusUpdateMs = Date.now();
+          };
+
+          const endScrub = () => {
+            if (!scrubbing) return;
+            scrubbing = false;
+            if (resumeAfterScrub) {
+              resumeAfterScrub = false;
+              pauseOrResume();
+            } else {
+              updateStatus();
+            }
+          };
+
+          timelineEl.addEventListener('pointerdown', beginScrub);
+          timelineEl.addEventListener('pointerup', endScrub);
+          timelineEl.addEventListener('pointercancel', endScrub);
+          timelineEl.addEventListener('mousedown', beginScrub);
+          timelineEl.addEventListener('mouseup', endScrub);
+          timelineEl.addEventListener('touchstart', beginScrub, { passive: true });
+          timelineEl.addEventListener('touchend', endScrub, { passive: true });
+
+          timelineEl.addEventListener('input', () => {
+            if (!cues.length) return;
+            const value = Number(timelineEl.value);
+            if (!Number.isFinite(value)) return;
+            setCurrentTime(value, { skipStatus: true, skipSlider: true });
+            setStatus('Scrubbing at ' + formatTime(currentTimeMs));
+            lastStatusUpdateMs = Date.now();
+          });
+
+          timelineEl.addEventListener('change', () => {
+            if (!cues.length) return;
+            updateStatus();
+          });
+        }
+
+        if (stageEl) {
+          stageEl.addEventListener('wheel', (event) => {
+            if (!cues.length) return;
+            event.preventDefault();
+            const primaryDelta = event.deltaY !== 0 ? event.deltaY : event.deltaX;
+            if (!primaryDelta) return;
+            const multiplier = event.ctrlKey || event.metaKey ? 5 : event.shiftKey ? 10 : 40;
+            const newTime = currentTimeMs + primaryDelta * multiplier;
+            const wasPlaying = playing;
+            if (wasPlaying) {
+              pauseOrResume();
+            }
+            resumeAfterScrub = false;
+            scrubbing = false;
+            setCurrentTime(newTime, { skipStatus: true });
+            setStatus('Scrolled to ' + formatTime(currentTimeMs));
+            lastStatusUpdateMs = Date.now();
+          }, { passive: false });
+        }
+
+        updateTimelineUI({ skipSlider: true });
 
         // Prevent screen dimming as much as possible by keeping interactions simple
         // and minimizing unnecessary reflows. For iOS, consider turning off Auto-Lock in Settings for long sessions.
